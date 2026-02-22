@@ -1,0 +1,29 @@
+# Pathway Framework (will be added in Phase 6)
+# pathway>=0.7.0  # Commented out for now - not needed for current implementation
+
+# AI/ML Models
+roboflow>=1.1.0
+easyocr>=1.7.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# HTTP/WebSocket
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+httpx>=0.25.0
+python-multipart>=0.0.6
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.0.0
+python-dateutil>=2.8.2
+
+# Logging
+loguru>=0.7.0

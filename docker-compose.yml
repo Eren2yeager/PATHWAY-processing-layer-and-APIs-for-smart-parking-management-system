@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  pathway-backend:
+    build: .
+    container_name: pathway-smart-parking
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount code for development (hot reload)
+      - .:/app
+      # Mount logs
+      - ./logs:/app/logs
+    environment:
+      - PATHWAY_HOST=0.0.0.0
+      - PATHWAY_PORT=8000
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - parking-network
+    # Add DNS servers for external connectivity
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    # Add extra hosts for Next.js connection
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  parking-network:
+    driver: bridge

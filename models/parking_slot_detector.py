@@ -23,8 +23,12 @@ class ParkingSlotDetectorModel:
     
     def __init__(self):
         """Initialize Roboflow parking slot detection model"""
+        self.detection_model = None
         self._init_roboflow()
-        logger.info("Parking Slot Detector initialized successfully")
+        if self.detection_model:
+            logger.info("Parking Slot Detector initialized successfully")
+        else:
+            logger.warning("Parking Slot Detector initialized WITHOUT model (will retry on first request)")
     
     def _init_roboflow(self):
         """Initialize Roboflow parking detection model"""
@@ -80,6 +84,13 @@ class ParkingSlotDetectorModel:
                 temp_path = temp_file.name
                 pil_image.save(temp_path, quality=85)
             
+            # Lazy retry: if model failed to load at startup, try again now
+            if self.detection_model is None:
+                logger.info("Retrying Roboflow parking slot model initialization...")
+                self._init_roboflow()
+                if self.detection_model is None:
+                    raise RuntimeError("Roboflow parking slot model not available — check API key and network")
+
             # Run Roboflow detection
             result = self.detection_model.predict(
                 temp_path,

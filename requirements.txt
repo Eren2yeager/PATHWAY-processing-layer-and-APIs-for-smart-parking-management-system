@@ -1,5 +1,5 @@
-# Pathway Framework (will be added in Phase 6)
-# pathway>=0.7.0  # Commented out for now - not needed for current implementation
+# Pathway Framework
+pathway>=0.7.0
 
 # AI/ML Models
 roboflow>=1.1.0

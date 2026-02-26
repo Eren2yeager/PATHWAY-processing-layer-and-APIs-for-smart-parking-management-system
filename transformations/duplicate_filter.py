@@ -37,11 +37,13 @@ class DuplicateFilter:
         
         window = window_seconds * 1000 if window_seconds else self.window_ms
         
-        # Deduplicate by plate number and parking lot within time window
+        # Deduplicate by timestamp within each (plate_number, parking_lot_id) group.
+        # acceptor(new_timestamp, old_timestamp) -> True means "accept the new row"
+        # We accept a new detection only if enough time has passed since the last one.
         unique_detections = detections_table.deduplicate(
-            key=pw.this.plate_number,
-            instance=pw.this.parking_lot_id,
-            acceptor=pw.temporal.tumbling(duration=window)
+            value=pw.this.timestamp,
+            instance=pw.this.plate_number,
+            acceptor=lambda new_ts, old_ts: abs(new_ts - old_ts) >= window,
         )
         
         return unique_detections

@@ -25,6 +25,7 @@ class LicensePlateDetectorModel:
     
     def __init__(self):
         """Initialize Roboflow and EasyOCR models"""
+        self.detection_model = None
         self._init_roboflow()
         self._init_easyocr()
         
@@ -32,7 +33,10 @@ class LicensePlateDetectorModel:
         self.api_call_times = []
         self.max_tracked_times = 20
         
-        logger.info("License Plate Detector initialized successfully")
+        if self.detection_model:
+            logger.info("License Plate Detector initialized successfully")
+        else:
+            logger.warning("License Plate Detector initialized WITHOUT model (will retry on first request)")
     
     def _init_roboflow(self):
         """Initialize Roboflow license plate detection model"""
@@ -157,6 +161,13 @@ class LicensePlateDetectorModel:
                 temp_path = temp_file.name
                 pil_image.save(temp_path, quality=75)
             
+            # Lazy retry: if model failed to load at startup, try again now
+            if self.detection_model is None:
+                logger.info("Retrying Roboflow license plate model initialization...")
+                self._init_roboflow()
+                if self.detection_model is None:
+                    raise RuntimeError("Roboflow license plate model not available — check API key and network")
+
             # Run Roboflow detection
             result = self.detection_model.predict(
                 temp_path,

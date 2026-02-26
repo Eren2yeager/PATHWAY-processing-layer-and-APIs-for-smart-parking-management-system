@@ -1,336 +1,289 @@
 """
 Pathway Pipeline Manager
-Orchestrates Pathway stateful processing pipelines
+Wires up real Pathway tables, transformations, and IO connectors.
+
+Architecture:
+    WebSocket handlers
+        → ConnectorSubjects (push data)
+            → pw.io.python.read() creates pw.Table
+                → transformations (filter, deduplicate, aggregate)
+                    → pw.io.python.write() triggers ConnectorObservers
+                        → HTTP webhooks to Next.js
+
+    pw.run() drives the entire computation in a background thread.
 """
 
 import pathway as pw
+import threading
+import time
 from typing import Optional
-import asyncio
 
+from config.settings import settings
+from utils.logger import logger
+
+# Input connectors
+from connectors.camera_input import (
+    VehicleDetectionSubject,
+    CapacityUpdateSubject,
+    VehicleEventSchema,
+    CapacityEventSchema,
+)
+
+# Output observers
+from connectors.nextjs_output import (
+    VehicleEventObserver,
+    CapacityEventObserver,
+    set_slot_store_data,
+    set_slot_store_batch,
+)
+
+# Transformations (these already contain real Pathway code!)
 from transformations.vehicle_tracking import VehicleTracker
 from transformations.capacity_aggregation import CapacityAggregator
 from transformations.duplicate_filter import DuplicateFilter
-from connectors.camera_input import PathwayStreamConnector
-from connectors.nextjs_output import PathwayOutputHandler
-from config.settings import settings
-from utils.logger import logger
 
 
 class PathwayPipelineManager:
     """
-    Manages Pathway streaming pipelines for smart parking
-    Provides stateful processing on top of FastAPI layer
+    Orchestrates the real Pathway stream processing pipeline.
+
+    Replaces the old dict-based fake pipeline with:
+    - pw.io.python.read() to ingest data from WebSocket handlers
+    - Pathway transformations for dedup, tracking, aggregation
+    - pw.io.python.write() to output results to Next.js webhooks
+    - pw.run() in a background thread to drive computation
     """
-    
+
     def __init__(self):
+        # Input subjects — WebSocket handlers push data into these
+        self.vehicle_subject = VehicleDetectionSubject()
+        self.capacity_subject = CapacityUpdateSubject()
+
+        # Transformations
         self.vehicle_tracker = VehicleTracker()
         self.capacity_aggregator = CapacityAggregator()
-        self.duplicate_filter = DuplicateFilter(window_seconds=settings.duplicate_detection_window)
-        self.stream_connector = PathwayStreamConnector()
-        self.output_handler = PathwayOutputHandler()
-        # Real-time capacity cache per lot (for GET /api/capacity/current)
-        self._last_capacity: dict = {}
+        self.duplicate_filter = DuplicateFilter(
+            window_seconds=settings.duplicate_detection_window
+        )
+
+        # Output observers
+        self.vehicle_observer = VehicleEventObserver()
+        self.capacity_observer = CapacityEventObserver()
 
         # Pipeline state
-        self.is_running = False
-        self.pipeline_task = None
-    
-    async def start(self):
-        """Start Pathway pipelines"""
-        if self.is_running:
-            logger.warning("Pathway pipeline already running")
-            return
-        
-        logger.info("Starting Pathway stateful processing pipelines...")
-        self.is_running = True
-        
-        # Start background pipeline processing
-        self.pipeline_task = asyncio.create_task(self._run_pipeline())
-        
-        logger.info("✓ Pathway pipelines started")
-    
-    async def stop(self):
-        """Stop Pathway pipelines"""
-        if not self.is_running:
-            return
-        
-        logger.info("Stopping Pathway pipelines...")
-        self.is_running = False
-        
-        if self.pipeline_task:
-            self.pipeline_task.cancel()
-            try:
-                await self.pipeline_task
-            except asyncio.CancelledError:
-                pass
-        
-        await self.output_handler.close()
-        logger.info("✓ Pathway pipelines stopped")
-    
-    async def _run_pipeline(self):
-        """
-        Main pipeline processing loop
-        Processes buffered events through Pathway transformations
-        """
-        try:
-            while self.is_running:
-                # Process vehicle events
-                vehicle_events = self.stream_connector.get_vehicle_events()
-                if vehicle_events:
-                    await self._process_vehicle_events(vehicle_events)
-                
-                # Process capacity events
-                capacity_events = self.stream_connector.get_capacity_events()
-                if capacity_events:
-                    await self._process_capacity_events(capacity_events)
-                
-                # Sleep briefly to avoid busy loop
-                await asyncio.sleep(0.1)
-        
-        except asyncio.CancelledError:
-            logger.info("Pipeline processing cancelled")
-        except Exception as e:
-            logger.error(f"Pipeline error: {e}")
-    
-    async def _process_vehicle_events(self, events: list):
-        """
-        Process vehicle detection events through Pathway pipeline
-        
-        Args:
-            events: List of vehicle detection events
-        """
-        try:
-            # In a full Pathway implementation, these would be processed
-            # through Pathway tables with stateful transformations
-            
-            # For now, we'll implement the logic manually but following
-            # Pathway's stateful processing patterns
-            
-            for event in events:
-                # Apply duplicate filtering logic
-                if self._is_duplicate_vehicle_event(event):
-                    logger.debug(f"Filtered duplicate: {event['plate_number']}")
-                    continue
-                
-                # Track vehicle state
-                await self._track_vehicle_state(event)
-                
-                # Send to Next.js
-                if event['event_type'] == 'entry':
-                    await self.output_handler.connector.send_vehicle_entry(event)
-                elif event['event_type'] == 'exit':
-                    # Calculate duration if we have entry record
-                    duration = await self._calculate_duration(event)
-                    if duration:
-                        event['duration_seconds'] = duration
-                    await self.output_handler.connector.send_vehicle_exit(event)
-        
-        except Exception as e:
-            logger.error(f"Error processing vehicle events: {e}")
-    
-    async def _process_capacity_events(self, events: list):
-        """
-        Process capacity events through Pathway pipeline
-        
-        Args:
-            events: List of capacity update events
-        """
-        try:
-            if not events:
-                return
-            
-            logger.debug(f"Processing {len(events)} capacity events")
-            
-            # Group events by parking lot
-            lots = {}
-            for event in events:
-                lot_id = event['parking_lot_id']
-                if lot_id not in lots:
-                    lots[lot_id] = []
-                lots[lot_id].append(event)
-            
-            logger.debug(f"Grouped into {len(lots)} parking lots")
-            
-            # Aggregate capacity for each lot
-            for lot_id, lot_events in lots.items():
-                logger.debug(f"Aggregating {len(lot_events)} events for lot {lot_id}")
-                capacity_data = self._aggregate_capacity(lot_events)
-                self._last_capacity[lot_id] = capacity_data
+        self._pipeline_thread: Optional[threading.Thread] = None
+        self._is_running = False
 
-                # Check for threshold breaches
-                if capacity_data['occupancy_rate'] >= 0.9:
-                    breach_data = {
-                        **capacity_data,
-                        'breach_time': capacity_data['last_updated'],
-                        'severity': 'critical' if capacity_data['occupancy_rate'] >= 0.95 else 'warning'
-                    }
-                    await self.output_handler.handle_threshold_breach(breach_data)
-                else:
-                    # Send normal capacity update
-                    await self.output_handler.handle_capacity_update(capacity_data)
-        
+        logger.info("[PathwayPipeline] Manager initialized")
+
+    def build_pipeline(self) -> None:
+        """
+        Build the Pathway dataflow graph.
+        Must be called BEFORE pw.run().
+        """
+        logger.info("[PathwayPipeline] Building Pathway dataflow graph...")
+
+        # ── Step 1: Create input tables from ConnectorSubjects ──
+        vehicle_events_table = pw.io.python.read(
+            self.vehicle_subject,
+            schema=VehicleEventSchema,
+            autocommit_duration_ms=500,     # commit every 500ms for real-time feel
+        )
+
+        capacity_events_table = pw.io.python.read(
+            self.capacity_subject,
+            schema=CapacityEventSchema,
+            autocommit_duration_ms=500,
+        )
+
+        logger.info("[PathwayPipeline] ✅ Input tables created")
+
+        # ── Step 2: Vehicle processing pipeline ──
+        # Filter low-confidence detections (settings are percentages 0-100, convert to 0-1)
+        high_conf_vehicles = self.duplicate_filter.filter_low_confidence_detections(
+            vehicle_events_table,
+            min_confidence=settings.plate_detection_confidence / 100.0,
+        )
+
+        # Deduplicate plates within time window
+        unique_vehicles = self.duplicate_filter.filter_duplicate_plates(
+            high_conf_vehicles,
+            window_seconds=settings.duplicate_detection_window,
+        )
+
+        # Output: Forward unique vehicle events to Next.js
+        pw.io.python.write(unique_vehicles, self.vehicle_observer)
+
+        logger.info("[PathwayPipeline] ✅ Vehicle pipeline built (filter → dedup → webhook)")
+
+        # ── Step 3: Capacity processing pipeline ──
+        # Filter low-confidence slot detections
+        high_conf_capacity = self.duplicate_filter.filter_low_confidence_detections(
+            capacity_events_table,
+            min_confidence=settings.parking_slot_confidence / 100.0,
+        )
+
+        # Aggregate slots into per-lot capacity metrics
+        capacity_metrics = self.capacity_aggregator.aggregate_capacity(
+            high_conf_capacity
+        )
+
+        # Output: Forward aggregated capacity to Next.js
+        pw.io.python.write(capacity_metrics, self.capacity_observer)
+
+        logger.info("[PathwayPipeline] ✅ Capacity pipeline built (filter → aggregate → webhook)")
+
+        logger.info("[PathwayPipeline] 🎯 Pathway dataflow graph ready — call start() to run")
+
+    def start(self) -> None:
+        """Start the Pathway engine in a background thread."""
+        if self._is_running:
+            logger.warning("[PathwayPipeline] Already running")
+            return
+
+        # Build the dataflow graph first
+        self.build_pipeline()
+
+        # Run pw.run() in a background thread (it's blocking)
+        self._is_running = True
+        self._pipeline_thread = threading.Thread(
+            target=self._run_pathway_engine,
+            name="pathway-engine",
+            daemon=True,
+        )
+        self._pipeline_thread.start()
+        logger.info("[PathwayPipeline] 🚀 Pathway engine started in background thread")
+
+    def _run_pathway_engine(self) -> None:
+        """Run the Pathway engine (blocking call)."""
+        try:
+            logger.info("[PathwayPipeline] pw.run() starting...")
+            pw.run(monitoring_level=pw.MonitoringLevel.NONE)
         except Exception as e:
-            logger.error(f"Error processing capacity events: {e}")
-    
-    def _is_duplicate_vehicle_event(self, event: dict) -> bool:
-        """
-        Check if vehicle event is a duplicate (within time window)
-        Implements Pathway's deduplication logic
-        """
-        # This would use Pathway's deduplicate() in full implementation
-        # For now, simple time-based check
-        key = f"{event['plate_number']}_{event['parking_lot_id']}"
-        current_time = event['timestamp']
-        
-        if not hasattr(self, '_last_vehicle_events'):
-            self._last_vehicle_events = {}
-        
-        if key in self._last_vehicle_events:
-            last_time = self._last_vehicle_events[key]
-            if (current_time - last_time) < (settings.duplicate_detection_window * 1000):
-                return True
-        
-        self._last_vehicle_events[key] = current_time
-        return False
-    
-    async def _track_vehicle_state(self, event: dict):
-        """
-        Track vehicle state (entry/exit)
-        Implements Pathway's stateful tracking
-        """
-        if not hasattr(self, '_vehicle_state'):
-            self._vehicle_state = {}
-        
-        key = f"{event['plate_number']}_{event['parking_lot_id']}"
-        
-        if event['event_type'] == 'entry':
-            self._vehicle_state[key] = {
-                'entry_time': event['timestamp'],
-                'entry_camera': event['camera_id'],
-                'entry_confidence': event['confidence'],
-            }
-        elif event['event_type'] == 'exit':
-            # State will be used for duration calculation
+            logger.error(f"[PathwayPipeline] pw.run() error: {e}")
+        finally:
+            self._is_running = False
+            logger.info("[PathwayPipeline] pw.run() exited")
+
+    def stop(self) -> None:
+        """Stop the Pathway pipeline."""
+        if not self._is_running:
+            return
+
+        logger.info("[PathwayPipeline] Stopping pipeline...")
+        self._is_running = False
+
+        # Signal the input subjects to stop
+        try:
+            self.vehicle_subject.close()
+        except Exception:
             pass
-    
-    async def _calculate_duration(self, exit_event: dict) -> Optional[float]:
-        """
-        Calculate parking duration
-        Implements Pathway's join logic for entry/exit matching
-        """
-        if not hasattr(self, '_vehicle_state'):
-            return None
-        
-        key = f"{exit_event['plate_number']}_{exit_event['parking_lot_id']}"
-        
-        if key in self._vehicle_state:
-            entry_data = self._vehicle_state[key]
-            duration_ms = exit_event['timestamp'] - entry_data['entry_time']
-            duration_seconds = duration_ms / 1000
-            
-            # Clean up state
-            del self._vehicle_state[key]
-            
-            return duration_seconds
-        
-        return None
-    
-    def _aggregate_capacity(self, events: list) -> dict:
-        """
-        Aggregate capacity from slot events
-        Implements Pathway's groupby().reduce() logic
-        """
-        # Get latest status for each slot
-        slots = {}
-        for event in events:
-            slot_id = event['slot_id']
-            if slot_id not in slots or event['timestamp'] > slots[slot_id]['timestamp']:
-                slots[slot_id] = event
-        
-        # Calculate aggregates
-        total_slots = len(slots)
-        occupied = sum(1 for s in slots.values() if s['status'] == 'occupied')
-        empty = total_slots - occupied
-        occupancy_rate = occupied / total_slots if total_slots > 0 else 0.0
-        
-        # Get latest timestamp
-        last_updated = max(s['timestamp'] for s in slots.values()) if slots else 0
-        
-        # Format individual slots for Next.js
-        slots_array = [
-            {
-                'slot_id': slot_id,
-                'status': slot_data['status'],
-                'confidence': slot_data['confidence']
-            }
-            for slot_id, slot_data in slots.items()
-        ]
-        
-        logger.debug(f"Aggregated capacity: lot={events[0]['parking_lot_id']}, "
-                    f"total={total_slots}, occupied={occupied}, slots_array_len={len(slots_array)}")
-        
-        return {
-            'parking_lot_id': events[0]['parking_lot_id'],
-            'total_slots': total_slots,
-            'occupied': occupied,
-            'empty': empty,
-            'occupancy_rate': occupancy_rate,
-            'last_updated': last_updated,
-            'slots': slots_array,  # Include individual slot details
-        }
-    
-    # Public API for FastAPI integration
-    
+        try:
+            self.capacity_subject.close()
+        except Exception:
+            pass
+
+        # Wait for the pipeline thread to finish
+        if self._pipeline_thread and self._pipeline_thread.is_alive():
+            self._pipeline_thread.join(timeout=5)
+
+        logger.info("[PathwayPipeline] Pipeline stopped")
+
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+
+    # ── Convenience methods for WebSocket handlers ──
+
     def add_vehicle_detection(
         self,
         plate_number: str,
         parking_lot_id: str,
-        camera_id: str,
-        event_type: str,
-        confidence: float,
-        timestamp: Optional[int] = None
-    ):
-        """Add vehicle detection to Pathway pipeline"""
-        self.stream_connector.add_vehicle_detection(
+        camera_id: str = "unknown",
+        event_type: str = "entry",
+        confidence: float = 0.0,
+        timestamp: Optional[int] = None,
+    ) -> None:
+        """
+        Push a vehicle detection into the Pathway pipeline.
+        Called from main.py WebSocket handlers.
+        """
+        if not self._is_running:
+            logger.warning("[PathwayPipeline] Pipeline not running, ignoring detection")
+            return
+
+        self.vehicle_subject.push_detection(
             plate_number=plate_number,
             parking_lot_id=parking_lot_id,
             camera_id=camera_id,
             event_type=event_type,
             confidence=confidence,
-            timestamp=timestamp
+            timestamp=timestamp,
         )
-    
+
     def add_capacity_update(
         self,
         parking_lot_id: str,
-        camera_id: str,
-        slot_id: int,
-        status: str,
-        confidence: float,
-        timestamp: Optional[int] = None
-    ):
-        """Add capacity update to Pathway pipeline"""
-        self.stream_connector.add_capacity_update(
+        camera_id: str = "unknown",
+        slot_id: int = 0,
+        status: str = "empty",
+        confidence: float = 0.0,
+        timestamp: Optional[int] = None,
+    ) -> None:
+        """
+        Push a single slot update into the Pathway pipeline.
+        Called from main.py WebSocket handlers.
+        """
+        if not self._is_running:
+            logger.warning("[PathwayPipeline] Pipeline not running, ignoring capacity update")
+            return
+
+        # Store slot info in module-level store for the observer
+        set_slot_store_data(parking_lot_id, slot_id, status, confidence)
+
+        self.capacity_subject.push_slot_update(
             parking_lot_id=parking_lot_id,
             camera_id=camera_id,
             slot_id=slot_id,
             status=status,
             confidence=confidence,
-            timestamp=timestamp
+            timestamp=timestamp,
         )
 
-    def get_current_capacity(self, parking_lot_id: str) -> Optional[dict]:
-        """Get latest aggregated capacity for a parking lot (real-time from Pathway state)."""
-        return self._last_capacity.get(parking_lot_id)
+    def add_capacity_batch(
+        self,
+        parking_lot_id: str,
+        camera_id: str,
+        slots: list,
+        timestamp: Optional[int] = None,
+    ) -> None:
+        """
+        Push a batch of slot detections into the Pathway pipeline.
+        Called from main.py WebSocket handlers after each lot frame.
+        """
+        if not self._is_running:
+            logger.warning("[PathwayPipeline] Pipeline not running, ignoring capacity batch")
+            return
+
+        # Store full slot snapshot in module-level store for the observer
+        set_slot_store_batch(parking_lot_id, slots)
+
+        self.capacity_subject.push_capacity_batch(
+            parking_lot_id=parking_lot_id,
+            camera_id=camera_id,
+            slots=slots,
+            timestamp=timestamp,
+        )
 
 
-# Global pipeline instance
-pathway_pipeline: Optional[PathwayPipelineManager] = None
+# ── Singleton factory ─────────────────────────────────────────
+
+_pipeline_instance: PathwayPipelineManager | None = None
 
 
 def get_pathway_pipeline() -> PathwayPipelineManager:
-    """Get global Pathway pipeline instance"""
-    global pathway_pipeline
-    if pathway_pipeline is None:
-        pathway_pipeline = PathwayPipelineManager()
-    return pathway_pipeline
+    """Get or create the singleton PathwayPipelineManager."""
+    global _pipeline_instance
+    if _pipeline_instance is None:
+        _pipeline_instance = PathwayPipelineManager()
+    return _pipeline_instance

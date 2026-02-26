@@ -1,118 +1,149 @@
-# Quick Start Guide - Pathway Smart Parking System
+# Quick Start Guide — Pathway Smart Parking Backend
 
-## 🚀 Get Started in 5 Minutes
+Get the Pathway-powered parking backend running in Docker in under 5 minutes.
 
-### Step 1: Setup Environment
+## Prerequisites
 
-**Windows:**
-```bash
-cd pathway-work
-setup.bat
-```
+- **Docker Desktop** installed and running
+- **Roboflow API Key** — sign up at [roboflow.com](https://roboflow.com) (free tier works)
+- **Next.js frontend** running on `http://localhost:3000` (see `next.js-work/` folder)
 
-**Linux/Mac:**
-```bash
-cd pathway-work
-chmod +x setup.sh
-./setup.sh
-```
+## Step 1: Configure Environment
 
-### Step 2: Configure API Keys
-
-Edit `.env` file and add your Roboflow API key:
+Copy or edit the `.env` file in the `pathway-work/` directory:
 
 ```bash
-ROBOFLOW_API_KEY=your_actual_api_key_here
-ROBOFLOW_WORKSPACE=your_workspace
+# Required — your Roboflow API key
+ROBOFLOW_API_KEY=your_api_key_here
+ROBOFLOW_WORKSPACE=your_workspace_name
+
+# Roboflow model projects (these are the default models)
 ROBOFLOW_LICENSE_PLATE_PROJECT=license-plate-recognition-rxg4e
 ROBOFLOW_LICENSE_PLATE_VERSION=11
 ROBOFLOW_PARKING_SLOT_PROJECT=car-space-find
 ROBOFLOW_PARKING_SLOT_VERSION=2
+
+# Detection confidence thresholds (0-100)
+PLATE_DETECTION_CONFIDENCE=20
+PARKING_SLOT_CONFIDENCE=20
+
+# Frame skip (higher = less CPU, lower = more responsive)
+GATE_FRAME_SKIP=10
+LOT_FRAME_SKIP=20
+
+# Pathway webhook secret (must match PATHWAY_WEBHOOK_SECRET in next.js-work/.env.local)
+PATHWAY_WEBHOOK_SECRET=your_shared_secret
+
+# Next.js URL (Docker uses host.docker.internal to reach your host machine)
+NEXTJS_API_URL=http://host.docker.internal:3000
 ```
 
-### Step 3: Run the Application
+> **Important:** The `PATHWAY_WEBHOOK_SECRET` must match the value in `next.js-work/.env.local` for webhook authentication to work.
 
-**Activate virtual environment:**
+## Step 2: Build & Start the Container
 
-Windows:
 ```bash
-venv\Scripts\activate
+cd pathway-work
+docker-compose up --build -d
 ```
 
-Linux/Mac:
+First build takes ~2-3 minutes (downloads Python packages). Subsequent builds are cached.
+
+## Step 3: Verify It's Running
+
+**Check logs:**
+
 ```bash
-source venv/bin/activate
+docker logs -f pathway-smart-parking
 ```
 
-**Start the server:**
-```bash
-python main.py
+You should see:
+
+```
+✓ License Plate Detector
+✓ Parking Slot Detector
+✓ Vehicle Detector
+✅ Input tables created
+✅ Vehicle pipeline built
+✅ Capacity pipeline built
+🚀 Pathway engine started in background thread
+Application startup complete.
+INFO: Uvicorn running on http://0.0.0.0:8000
 ```
 
-The server will start on `http://localhost:8000`
+**Health check:**
 
-### Step 4: Test the APIs
-
-**Health Check:**
 ```bash
 curl http://localhost:8000/api/health
 ```
 
-**Test License Plate Detection:**
+**API docs:**
+
+```
+http://localhost:8000/docs
+```
+
+## Step 4: Connect to Next.js
+
+Make sure your Next.js frontend (in `next.js-work/`) has these in `.env.local`:
+
+```bash
+PYTHON_BACKEND_URL=http://localhost:8000
+PATHWAY_WEBHOOK_SECRET=your_shared_secret   # Must match pathway-work/.env
+```
+
+The frontend connects to the Pathway backend via:
+
+- **WebSocket** `ws://localhost:8000/ws/gate-monitor` — live plate detection
+- **WebSocket** `ws://localhost:8000/ws/lot-monitor` — live slot detection
+- **REST** `http://localhost:8000/api/detect-parking-slots` — slot detection for parking lot creation
+
+## Common Commands
+
+```bash
+# Start in background
+docker-compose up -d
+
+# View live logs
+docker logs -f pathway-smart-parking
+
+# Restart (picks up code changes via volume mount)
+docker-compose restart
+
+# Stop
+docker-compose down
+
+# Rebuild (only needed if requirements.txt changes)
+docker-compose up --build -d
+```
+
+## Test the APIs
+
+**License Plate Detection:**
+
 ```bash
 curl -X POST http://localhost:8000/api/recognize-plate \
   -F "file=@test_image.jpg"
 ```
 
-**Test Parking Slot Detection:**
+**Parking Slot Detection:**
+
 ```bash
 curl -X POST http://localhost:8000/api/detect-parking-slots \
   -F "file=@parking_lot.jpg"
 ```
 
-### Step 5: Connect Next.js
+## Troubleshooting
 
-Your Next.js app should already be configured to connect to `http://localhost:8000`.
+| Issue                                            | Solution                                                              |
+| ------------------------------------------------ | --------------------------------------------------------------------- |
+| `failed to resolve source metadata` during build | Check your internet connection — Docker needs to pull the base image  |
+| `WITHOUT model (will retry on first request)`    | Roboflow API unreachable at startup — models auto-retry on first use  |
+| `connect ECONNREFUSED 127.0.0.1:3000` in logs    | Start the Next.js frontend first: `cd next.js-work && npm run dev`    |
+| `X-Pathway-Secret mismatch` in Next.js logs      | Ensure `PATHWAY_WEBHOOK_SECRET` matches in both `.env` files          |
+| `Port 8000 already in use`                       | Change `PATHWAY_PORT` in `.env` and update `docker-compose.yml` ports |
+| `CUDA not available`                             | Normal — EasyOCR auto-falls back to CPU mode                          |
 
-The WebSocket endpoints are:
-- `ws://localhost:8000/ws/gate-monitor` - License plate detection stream
-- `ws://localhost:8000/ws/lot-monitor` - Parking capacity stream
+## Architecture Overview
 
-## 📊 API Documentation
-
-Once running, visit:
-- API Docs: `http://localhost:8000/docs`
-- Alternative Docs: `http://localhost:8000/redoc`
-
-## 🔧 Troubleshooting
-
-### Issue: "Module not found"
-**Solution:** Make sure virtual environment is activated and dependencies are installed:
-```bash
-pip install -r requirements.txt
-```
-
-### Issue: "Roboflow API key invalid"
-**Solution:** Check your `.env` file and ensure `ROBOFLOW_API_KEY` is set correctly.
-
-### Issue: "CUDA not available" (EasyOCR)
-**Solution:** EasyOCR will automatically fall back to CPU mode. This is normal if you don't have a GPU.
-
-### Issue: Port 8000 already in use
-**Solution:** Change the port in `.env`:
-```bash
-PATHWAY_PORT=8001
-```
-
-## 📝 Next Steps
-
-1. ✅ Test with your camera feeds
-2. ✅ Integrate with Next.js frontend
-3. ✅ Monitor performance and logs
-4. 🔜 Add Pathway stateful processing features
-
-## 🆘 Need Help?
-
-Check the logs in `logs/pathway.log` for detailed error messages.
-
-For more information, see the main [README.md](README.md) and [pathwayplan.md](../pathwayplan.md).
+For full technical details, see [README.md](README.md).

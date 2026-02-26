@@ -15,11 +15,9 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements first (for better caching)
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install Pathway (this will work on Linux container)
-RUN pip install --no-cache-dir pathway
+# Install Python dependencies (with retries for network resilience)
+RUN pip install --no-cache-dir --retries 3 --timeout 120 -r requirements.txt && \
+    pip install --no-cache-dir --retries 3 --timeout 120 pathway
 
 # Copy application code
 COPY . .

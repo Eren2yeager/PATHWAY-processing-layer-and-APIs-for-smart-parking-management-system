@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     nextjs_webhook_entry: str = os.getenv("NEXTJS_WEBHOOK_ENTRY", "/api/pathway/webhook/entry")
     nextjs_webhook_exit: str = os.getenv("NEXTJS_WEBHOOK_EXIT", "/api/pathway/webhook/exit")
     nextjs_webhook_capacity: str = os.getenv("NEXTJS_WEBHOOK_CAPACITY", "/api/pathway/webhook/capacity")
+    nextjs_webhook_timeout_seconds: float = float(os.getenv("NEXTJS_WEBHOOK_TIMEOUT_SECONDS", "30"))
+    pathway_webhook_secret: str = os.getenv("PATHWAY_WEBHOOK_SECRET", "")
     
     # Performance
     max_concurrent_streams: int = int(os.getenv("MAX_CONCURRENT_STREAMS", "10"))

@@ -1,207 +1,215 @@
 """
-Pathway Output Connectors to Next.js
-Sends processed data to Next.js webhook endpoints
+Pathway Output Connectors — Forward processed results to Next.js via HTTP webhooks.
+
+Uses:
+- NextJSOutputConnector: HTTP client for sending data to Next.js webhooks
+- VehicleEventObserver: pw.io.python.ConnectorObserver that reacts to vehicle table changes
+- CapacityEventObserver: pw.io.python.ConnectorObserver that reacts to capacity table changes
 """
 
 import pathway as pw
 import httpx
-import asyncio
-from typing import Dict, Any, Optional
-from datetime import datetime
 import json
-
+from typing import Dict, Any
 from config.settings import settings
 from utils.logger import logger
 
 
+# ── HTTP Client ───────────────────────────────────────────────
+
 class NextJSOutputConnector:
-    """Output connector that sends Pathway results to Next.js APIs"""
-    
+    """HTTP client for sending processed data to Next.js webhook endpoints."""
+
     def __init__(self):
-        self.client = httpx.AsyncClient(timeout=10.0)
-        self.nextjs_base_url = settings.nextjs_api_url
-    
+        timeout = httpx.Timeout(settings.nextjs_webhook_timeout_seconds)
+        headers = {}
+        if settings.pathway_webhook_secret:
+            headers["X-Pathway-Secret"] = settings.pathway_webhook_secret
+        self.client = httpx.AsyncClient(timeout=timeout, headers=headers)
+        self.nextjs_base_url = settings.nextjs_api_url.rstrip("/")
+
     async def send_vehicle_entry(self, data: Dict[str, Any]) -> bool:
-        """
-        Send vehicle entry event to Next.js
-        
-        Args:
-            data: Vehicle entry data
-            
-        Returns:
-            Success status
-        """
-        try:
-            url = f"{self.nextjs_base_url}{settings.nextjs_webhook_entry}"
-            response = await self.client.post(url, json=data)
-            
-            if response.status_code == 200:
-                logger.info(f"Vehicle entry sent to Next.js: {data.get('plate_number')}")
-                return True
-            else:
-                logger.error(f"Failed to send entry: {response.status_code}")
-                return False
-        except Exception as e:
-            logger.error(f"Error sending vehicle entry: {e}")
-            return False
-    
+        """Send vehicle entry event to Next.js webhook."""
+        url = f"{self.nextjs_base_url}{settings.nextjs_webhook_entry}"
+        return await self._send(url, data, "vehicle_entry")
+
     async def send_vehicle_exit(self, data: Dict[str, Any]) -> bool:
-        """
-        Send vehicle exit event to Next.js
-        
-        Args:
-            data: Vehicle exit data with duration
-            
-        Returns:
-            Success status
-        """
-        try:
-            url = f"{self.nextjs_base_url}{settings.nextjs_webhook_exit}"
-            response = await self.client.post(url, json=data)
-            
-            if response.status_code == 200:
-                logger.info(f"Vehicle exit sent to Next.js: {data.get('plate_number')}")
-                return True
-            else:
-                logger.error(f"Failed to send exit: {response.status_code}")
-                return False
-        except Exception as e:
-            logger.error(f"Error sending vehicle exit: {e}")
-            return False
-    
+        """Send vehicle exit event to Next.js webhook."""
+        url = f"{self.nextjs_base_url}{settings.nextjs_webhook_exit}"
+        return await self._send(url, data, "vehicle_exit")
+
     async def send_capacity_update(self, data: Dict[str, Any]) -> bool:
-        """
-        Send capacity update to Next.js
-        
-        Args:
-            data: Capacity metrics
-            
-        Returns:
-            Success status
-        """
+        """Send capacity update to Next.js webhook."""
+        url = f"{self.nextjs_base_url}{settings.nextjs_webhook_capacity}"
+        return await self._send(url, data, "capacity_update")
+
+    async def _send(self, url: str, data: Dict[str, Any], event_type: str) -> bool:
+        """Send data to a webhook endpoint with error handling."""
         try:
-            slots = data.get('slots', [])
-            # Log what we're sending
-            logger.info(f"Sending capacity update: lot={data.get('parking_lot_id')}, "
-                       f"occupied={data.get('occupied')}, total={data.get('total_slots')}, "
-                       f"slots_count={len(slots)}")
-            
-            # Log first few slots for debugging
-            if slots:
-                logger.debug(f"First 3 slots: {slots[:3]}")
-            else:
-                logger.warning("No slots in data!")
-            
-            # Log the full payload for debugging
-            logger.debug(f"Full payload keys: {list(data.keys())}")
-            
-            url = f"{self.nextjs_base_url}{settings.nextjs_webhook_capacity}"
             response = await self.client.post(url, json=data)
-            
-            if response.status_code == 200:
-                logger.info(f"Capacity update sent successfully: {data.get('parking_lot_id')}")
+            if response.status_code == 200 or response.status_code == 201:
+                logger.info(f"[NextJSOutput] {event_type} sent successfully to {url}")
                 return True
             else:
-                logger.error(f"Failed to send capacity: {response.status_code} - {response.text}")
+                logger.warning(
+                    f"[NextJSOutput] {event_type} failed: {response.status_code} — {response.text[:200]}"
+                )
                 return False
-        except Exception as e:
-            logger.error(f"Error sending capacity update: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+        except httpx.ConnectTimeout:
+            logger.error(f"[NextJSOutput] Connection timeout sending {event_type} to {url}")
             return False
-    
+        except httpx.ConnectError:
+            logger.error(f"[NextJSOutput] Connection error sending {event_type} to {url} — is Next.js running?")
+            return False
+        except Exception as e:
+            logger.error(f"[NextJSOutput] Unexpected error sending {event_type}: {e}")
+            return False
+
     async def close(self):
-        """Close HTTP client"""
+        """Close the HTTP client."""
         await self.client.aclose()
 
 
-class PathwayOutputHandler:
-    """
-    Handler for Pathway table outputs
-    Processes Pathway computation results and sends to Next.js
-    """
-    
-    def __init__(self):
-        self.connector = NextJSOutputConnector()
-    
-    async def handle_vehicle_journey(self, journey_data: Dict[str, Any]):
-        """
-        Handle completed vehicle journey
-        
-        Args:
-            journey_data: Journey data with entry/exit times and duration
-        """
-        # Send entry event
-        entry_data = {
-            "plate_number": journey_data["plate_number"],
-            "parking_lot_id": journey_data["parking_lot_id"],
-            "camera_id": journey_data["entry_camera"],
-            "timestamp": journey_data["entry_time"],
-            "confidence": journey_data["entry_confidence"],
-            "event_type": "entry",
+# ── Pathway Output Observers ─────────────────────────────────
+
+# ── Sync HTTP client for Pathway observers ────────────────────
+# Pathway observers run in Pathway's engine thread (sync context).
+# Using sync httpx avoids "Event loop is closed" errors.
+
+_sync_client: httpx.Client | None = None
+
+# Module-level slot store — shared between pipeline manager and observer.
+# The pipeline manager writes to it, the observer reads from it.
+_capacity_slot_store: dict[str, dict] = {}
+
+
+def set_slot_store_data(parking_lot_id: str, slot_id: int, status: str, confidence: float):
+    """Called by pipeline manager to store individual slot data."""
+    if parking_lot_id not in _capacity_slot_store:
+        _capacity_slot_store[parking_lot_id] = {}
+    _capacity_slot_store[parking_lot_id][slot_id] = {
+        "slot_id": slot_id,
+        "status": status,
+        "confidence": confidence,
+    }
+
+
+def set_slot_store_batch(parking_lot_id: str, slots: list):
+    """Called by pipeline manager to store a full batch of slot data."""
+    _capacity_slot_store[parking_lot_id] = {
+        s.get("slot_id", s.get("slotId", i)): {
+            "slot_id": s.get("slot_id", s.get("slotId", i)),
+            "status": s.get("status", "empty"),
+            "confidence": s.get("confidence", 0.0),
         }
-        await self.connector.send_vehicle_entry(entry_data)
-        
-        # Send exit event with duration
-        exit_data = {
-            "plate_number": journey_data["plate_number"],
-            "parking_lot_id": journey_data["parking_lot_id"],
-            "camera_id": journey_data["exit_camera"],
-            "timestamp": journey_data["exit_time"],
-            "confidence": journey_data["exit_confidence"],
-            "duration_seconds": journey_data["duration_seconds"],
-            "event_type": "exit",
-        }
-        await self.connector.send_vehicle_exit(exit_data)
-    
-    async def handle_capacity_update(self, capacity_data: Dict[str, Any]):
-        """
-        Handle capacity update
-        
-        Args:
-            capacity_data: Aggregated capacity metrics
-        """
-        slots_array = capacity_data.get("slots", [])
-        logger.debug(f"handle_capacity_update received: lot={capacity_data['parking_lot_id']}, "
-                    f"slots_in_data={len(slots_array)}")
-        
+        for i, s in enumerate(slots)
+    }
+
+
+def _get_sync_client() -> httpx.Client:
+    """Get or create a sync HTTP client for observer callbacks."""
+    global _sync_client
+    if _sync_client is None:
+        timeout = httpx.Timeout(settings.nextjs_webhook_timeout_seconds)
+        headers = {}
+        if settings.pathway_webhook_secret:
+            headers["X-Pathway-Secret"] = settings.pathway_webhook_secret
+        _sync_client = httpx.Client(timeout=timeout, headers=headers)
+    return _sync_client
+
+
+def _sync_send(url: str, data: dict, event_type: str) -> bool:
+    """Send data synchronously from Pathway's observer thread."""
+    try:
+        client = _get_sync_client()
+        response = client.post(url, json=data)
+        if response.status_code in (200, 201):
+            logger.info(f"[NextJSOutput] {event_type} sent successfully to {url}")
+            return True
+        else:
+            logger.warning(f"[NextJSOutput] {event_type} failed: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"[NextJSOutput] Error sending {event_type}: {e}")
+        return False
+
+
+class VehicleEventObserver(pw.io.python.ConnectorObserver):
+    """
+    Pathway output observer for vehicle events.
+    Receives changes to the vehicle tracking table and forwards them
+    to Next.js via HTTP webhooks.
+    """
+
+    def on_change(self, key: pw.Pointer, row: dict, time: int, is_addition: bool):
+        """Called by Pathway engine when a row is added/removed from the output table."""
+        if not is_addition:
+            return
+
+        event_type = row.get("event_type", "entry")
+        base_url = settings.nextjs_api_url.rstrip("/")
+
         data = {
-            "parking_lot_id": capacity_data["parking_lot_id"],
-            "total_slots": capacity_data["total_slots"],
-            "occupied": capacity_data["occupied"],
-            "empty": capacity_data["empty"],
-            "occupancy_rate": capacity_data["occupancy_rate"],
-            "slots": slots_array,  # Include individual slot details
-            "timestamp": capacity_data.get("last_updated", int(datetime.now().timestamp() * 1000)),
+            "plate_number": row.get("plate_number", ""),
+            "parking_lot_id": row.get("parking_lot_id", ""),
+            "camera_id": row.get("camera_id", ""),
+            "confidence": row.get("confidence", 0.0),
+            "timestamp": row.get("timestamp", 0),
         }
-        
-        logger.debug(f"Sending to Next.js: slots_count={len(data['slots'])}")
-        await self.connector.send_capacity_update(data)
-    
-    async def handle_threshold_breach(self, breach_data: Dict[str, Any]):
-        """
-        Handle capacity threshold breach
-        
-        Args:
-            breach_data: Threshold breach event
-        """
-        logger.warning(
-            f"Capacity threshold breach: {breach_data['parking_lot_id']} "
-            f"at {breach_data['occupancy_rate']:.1%} occupancy"
+
+        logger.info(
+            f"[VehicleEventObserver] {event_type}: plate={data['plate_number']}, "
+            f"lot={data['parking_lot_id']}"
         )
-        
-        # Send as capacity update with alert flag
+
+        if event_type == "exit":
+            url = f"{base_url}{settings.nextjs_webhook_exit}"
+        else:
+            url = f"{base_url}{settings.nextjs_webhook_entry}"
+        _sync_send(url, data, f"vehicle_{event_type}")
+
+    def on_end(self):
+        logger.info("[VehicleEventObserver] Stream ended.")
+
+
+class CapacityEventObserver(pw.io.python.ConnectorObserver):
+    """
+    Pathway output observer for capacity aggregation results.
+    Receives changes to the capacity table and forwards them
+    to Next.js via HTTP webhooks.
+    """
+
+    def on_change(self, key: pw.Pointer, row: dict, time: int, is_addition: bool):
+        """Called by Pathway engine when capacity metrics change."""
+        if not is_addition:
+            return
+
+        base_url = settings.nextjs_api_url.rstrip("/")
+        url = f"{base_url}{settings.nextjs_webhook_capacity}"
+
+        parking_lot_id = row.get("parking_lot_id", "")
+
+        # Get individual slot data from module-level store
+        slot_dict = _capacity_slot_store.get(parking_lot_id, {})
+        slots_array = list(slot_dict.values()) if isinstance(slot_dict, dict) else []
+
         data = {
-            "parking_lot_id": breach_data["parking_lot_id"],
-            "occupied": breach_data["occupied"],
-            "total_slots": breach_data["total_slots"],
-            "occupancy_rate": breach_data["occupancy_rate"],
-            "alert": True,
-            "severity": breach_data["severity"],
-            "timestamp": breach_data["breach_time"],
+            "parking_lot_id": parking_lot_id,
+            "total_slots": row.get("total_slots", 0),
+            "occupied": row.get("occupied", 0),
+            "empty": row.get("empty_slots", 0),
+            "occupancy_rate": row.get("occupancy_rate", 0.0),
+            "slots": slots_array,
+            "timestamp": row.get("last_updated", row.get("timestamp", 0)),
         }
-        await self.connector.send_capacity_update(data)
-    
-    async def close(self):
-        """Cleanup resources"""
-        await self.connector.close()
+
+        logger.info(
+            f"[CapacityEventObserver] lot={parking_lot_id}, "
+            f"occupied={data['occupied']}/{data['total_slots']}, "
+            f"slots={len(slots_array)}"
+        )
+
+        _sync_send(url, data, "capacity_update")
+
+    def on_end(self):
+        logger.info("[CapacityEventObserver] Stream ended.")

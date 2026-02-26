@@ -46,16 +46,21 @@ class CapacityAggregator:
             last_updated=pw.reducers.max(pw.this.timestamp),
         )
         
-        # Aggregate by parking lot
-        capacity = latest_slots.groupby(pw.this.parking_lot_id).reduce(
+        # Pre-compute typed int columns BEFORE groupby (avoids pw.apply inside reduce)
+        latest_slots_typed = latest_slots.select(
+            parking_lot_id=pw.this.parking_lot_id,
+            is_occupied=pw.cast(int, pw.if_else(pw.this.status == "occupied", 1, 0)),
+            is_empty=pw.cast(int, pw.if_else(pw.this.status == "empty", 1, 0)),
+            confidence=pw.this.confidence,
+            last_updated=pw.this.last_updated,
+        )
+        
+        # Aggregate by parking lot — now sum() works on int columns
+        capacity = latest_slots_typed.groupby(pw.this.parking_lot_id).reduce(
             parking_lot_id=pw.this.parking_lot_id,
             total_slots=pw.reducers.count(),
-            occupied=pw.reducers.sum(
-                pw.apply(lambda status: 1 if status == "occupied" else 0, pw.this.status)
-            ),
-            empty=pw.reducers.sum(
-                pw.apply(lambda status: 1 if status == "empty" else 0, pw.this.status)
-            ),
+            occupied=pw.reducers.sum(pw.this.is_occupied),
+            empty_slots=pw.reducers.sum(pw.this.is_empty),
             avg_confidence=pw.reducers.avg(pw.this.confidence),
             last_updated=pw.reducers.max(pw.this.last_updated),
         )
@@ -65,11 +70,11 @@ class CapacityAggregator:
             parking_lot_id=pw.this.parking_lot_id,
             total_slots=pw.this.total_slots,
             occupied=pw.this.occupied,
-            empty=pw.this.empty,
-            occupancy_rate=pw.apply(
-                lambda occ, total: occ / total if total > 0 else 0.0,
-                pw.this.occupied,
-                pw.this.total_slots
+            empty_slots=pw.this.empty_slots,
+            occupancy_rate=pw.if_else(
+                pw.this.total_slots > 0,
+                pw.cast(float, pw.this.occupied) / pw.cast(float, pw.this.total_slots),
+                0.0,
             ),
             avg_confidence=pw.this.avg_confidence,
             last_updated=pw.this.last_updated,

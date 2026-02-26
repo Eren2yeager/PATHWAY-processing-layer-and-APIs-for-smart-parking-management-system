@@ -50,7 +50,10 @@ class ConnectionManager:
     
     def disconnect(self, websocket: WebSocket, channel: str):
         if channel in self.active_connections:
-            self.active_connections[channel].remove(websocket)
+            try:
+                self.active_connections[channel].remove(websocket)
+            except ValueError:
+                pass
         logger.info(f"Client disconnected from {channel}")
     
     async def broadcast(self, message: dict, channel: str):
@@ -58,8 +61,20 @@ class ConnectionManager:
             for connection in self.active_connections[channel]:
                 try:
                     await connection.send_json(message)
-                except:
+                except Exception:
                     pass
+
+    @staticmethod
+    async def safe_send(websocket: WebSocket, message: dict) -> bool:
+        """Send JSON to websocket only if still connected. Return True if sent."""
+        try:
+            if websocket.client_state.name != "CONNECTED":
+                return False
+            await websocket.send_json(message)
+            return True
+        except Exception as e:
+            logger.debug(f"WebSocket send failed (client may have disconnected): {e}")
+            return False
 
 manager = ConnectionManager()
 
@@ -103,22 +118,22 @@ async def lifespan(app: FastAPI):
         logger.warning("Server will start but some features may not work")
         # Don't raise - allow server to start anyway
     
-    # Initialize Pathway stateful processing pipeline
+    # Initialize Pathway real-time stream processing pipeline
     try:
-        logger.info("Initializing Pathway stateful processing pipeline...")
+        logger.info("Initializing Pathway stream processing pipeline...")
         pathway_pipeline = get_pathway_pipeline()
-        await pathway_pipeline.start()
-        logger.info("✓ Pathway pipeline started")
+        pathway_pipeline.start()  # builds dataflow graph + starts pw.run() in background thread
+        logger.info("✓ Pathway pipeline started (pw.run() in background thread)")
     except Exception as e:
         logger.error(f"Failed to start Pathway pipeline: {e}")
-        logger.warning("Continuing without Pathway stateful processing")
+        logger.warning("Continuing without Pathway stream processing")
     
     yield
     
     # Shutdown
     logger.info("Shutting down Pathway Smart Parking System...")
     if pathway_pipeline:
-        await pathway_pipeline.stop()
+        pathway_pipeline.stop()
 
 
 # Create FastAPI app
@@ -129,10 +144,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
+# Add CORS middleware — restrict to configured Next.js origin
+_cors_origins = [
+    settings.nextjs_api_url.rstrip("/"),
+]
+if settings.nextjs_api_url != "http://localhost:3000":
+    _cors_origins.append("http://localhost:3000")  # always allow localhost for dev
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -254,169 +275,44 @@ async def detect_parking_slots(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/capacity/current/{parking_lot_id}")
-async def get_capacity_current(parking_lot_id: str):
-    """Get current capacity state from Pathway (real-time aggregated state)."""
-    if not pathway_pipeline:
-        raise HTTPException(status_code=503, detail="Pathway pipeline not available")
-    data = pathway_pipeline.get_current_capacity(parking_lot_id)
-    if data is None:
-        return JSONResponse(
-            status_code=404,
-            content={"detail": f"No capacity data for parking_lot_id={parking_lot_id}"}
-        )
-    from datetime import datetime as dt
-    last_ts = data.get("last_updated")
-    last_updated = dt.utcfromtimestamp(last_ts / 1000).isoformat() + "Z" if isinstance(last_ts, (int, float)) else str(last_ts)
-    return {
-        "parking_lot_id": data["parking_lot_id"],
-        "total_slots": data["total_slots"],
-        "occupied": data["occupied"],
-        "empty": data["empty"],
-        "occupancy_rate": data["occupancy_rate"],
-        "last_updated": last_updated,
-        "slots": data.get("slots", []),
-    }
-
-
-@app.post("/api/process-frame")
-async def process_frame(request: Request):
-    """
-    Process a single frame (gate or lot). Accepts JSON: image (base64), camera_id, parking_lot_id, type ('gate'|'lot').
-    """
-    try:
-        body = await request.json()
-        image_b64 = body.get("image", "")
-        camera_id = body.get("camera_id", "upload")
-        parking_lot_id = body.get("parking_lot_id", "unknown")
-        frame_type = (body.get("type") or "gate").lower()
-        if not image_b64:
-            raise HTTPException(status_code=400, detail="Missing 'image' (base64)")
-        image = frame_processor.decode_base64_image(image_b64)
-        if frame_type == "gate":
-            detections = license_plate_detector.detect_and_recognize(image, camera_id=camera_id, parking_lot_id=parking_lot_id)
-            detections_out = [
-                {
-                    "plate_number": d.plate_number,
-                    "confidence": d.confidence,
-                    "bbox": {"x1": d.bbox.x1, "y1": d.bbox.y1, "x2": d.bbox.x2, "y2": d.bbox.y2},
-                }
-                for d in detections
-            ]
-            return {"detections": detections_out, "type": "gate", "timestamp": datetime.utcnow().isoformat()}
-        else:
-            result = parking_slot_detector.detect_slots(image, camera_id=camera_id, parking_lot_id=parking_lot_id)
-            slots = [
-                {"slot_id": s.slot_id, "status": s.status, "confidence": s.confidence, "bbox": {"x1": s.bbox.x1, "y1": s.bbox.y1, "x2": s.bbox.x2, "y2": s.bbox.y2}}
-                for s in result.slots
-            ]
-            return {
-                "total_slots": result.total_slots,
-                "occupied": result.occupied,
-                "empty": result.empty,
-                "occupancy_rate": result.occupancy_rate,
-                "slots": slots,
-                "type": "lot",
-                "timestamp": result.timestamp.isoformat(),
-                "processing_time_ms": result.processing_time_ms,
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"process-frame error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/detect-vehicle")
-async def detect_vehicle(file: UploadFile = File(...)):
-    """
-    Detect vehicles in uploaded image
-    Compatible with existing python-work API
-    """
-    try:
-        # Read image
-        image_bytes = await file.read()
-        image = frame_processor.decode_base64_image(
-            base64.b64encode(image_bytes).decode('utf-8')
-        )
-        
-        # Detect vehicles
-        detections = vehicle_detector.detect_vehicles(
-            image,
-            camera_id="upload",
-            parking_lot_id="unknown"
-        )
-        
-        return {
-            "success": True,
-            "vehicles_detected": len(detections),
-            "vehicles": [
-                {
-                    "vehicle_type": d.vehicle_type,
-                    "confidence": d.confidence,
-                    "bbox": {
-                        "x1": d.bbox.x1,
-                        "y1": d.bbox.y1,
-                        "x2": d.bbox.x2,
-                        "y2": d.bbox.y2
-                    }
-                }
-                for d in detections
-            ]
-        }
-    
-    except Exception as e:
-        logger.error(f"Vehicle detection failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.websocket("/ws/gate-monitor")
 async def gate_monitor_websocket(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time license plate detection
-    Compatible with existing python-work WebSocket
+    WebSocket endpoint for real-time license plate detection.
+    Expects: { data: base64_image, parking_lot_id or parkingLotId or gate_id, camera_id or gate_id, optional event_type: "entry"|"exit" }
     """
     await manager.connect(websocket, "gate-monitor")
+    logger.info("[GATE] Client connected to /ws/gate-monitor")
+    frame_count = 0  # frame skip counter
     
     try:
         while True:
-            # Receive frame data
             data = await websocket.receive_json()
-            
-            # Support both 'data' and 'image' fields for compatibility
             image_data = data.get("data") or data.get("image", "")
             if not image_data:
-                logger.warning("Received empty image data")
+                logger.warning("[GATE] Frame skipped: no 'data' or 'image' in payload")
+                continue
+            
+            # Frame skip: only process every Nth frame
+            frame_count += 1
+            if frame_count % settings.gate_frame_skip != 0:
                 continue
             
             try:
-                # Decode image
                 image = frame_processor.decode_base64_image(image_data)
+                camera_id = (data.get("camera_id") or data.get("gate_id") or data.get("lot_id") or "unknown")
+                parking_lot_id = (data.get("parking_lot_id") or data.get("parkingLotId") or data.get("gate_id") or data.get("lot_id") or "unknown")
+                event_type = data.get("event_type", "entry")
+                logger.debug(f"[GATE] Frame received (#{frame_count}): lot={parking_lot_id}, camera={camera_id}, event_type={event_type}, image_len={len(image_data)}")
                 
-                # Extract metadata - support multiple field names
-                camera_id = (data.get("camera_id") or 
-                           data.get("gate_id") or 
-                           data.get("lot_id") or 
-                           "unknown")
-                parking_lot_id = (data.get("parking_lot_id") or 
-                                data.get("parkingLotId") or 
-                                data.get("gate_id") or 
-                                "unknown")
-                
-                # Detect and recognize plates
                 detections = license_plate_detector.detect_and_recognize(
                     image,
                     camera_id=camera_id,
                     parking_lot_id=parking_lot_id
                 )
                 
-                # Feed detections into Pathway pipeline for stateful processing
-                if pathway_pipeline:
+                if pathway_pipeline and detections:
                     for detection in detections:
-                        # Determine event type (entry/exit) - default to entry
-                        event_type = data.get("event_type", "entry")
-                        
-                        # Add to Pathway pipeline
                         pathway_pipeline.add_vehicle_detection(
                             plate_number=detection.plate_number,
                             parking_lot_id=parking_lot_id,
@@ -425,88 +321,72 @@ async def gate_monitor_websocket(websocket: WebSocket):
                             confidence=detection.confidence,
                             timestamp=int(detection.timestamp.timestamp() * 1000)
                         )
+                    logger.info(f"[GATE] Pipeline fed {len(detections)} plate(s) for lot={parking_lot_id}, event_type={event_type}")
                 
-                # Send results back to frontend (real-time feedback)
-                # Check if WebSocket is still open before sending
-                if websocket.client_state.name == "CONNECTED":
-                    for detection in detections:
-                        await websocket.send_json({
-                            "event_type": "plate_detected",
-                            "plate_number": detection.plate_number,
-                            "confidence": detection.confidence,
-                            "timestamp": detection.timestamp.isoformat(),
-                            "parking_lot_id": parking_lot_id,
-                            "camera_id": camera_id,
-                            "bbox": {
-                                "x1": detection.bbox.x1,
-                                "y1": detection.bbox.y1,
-                                "x2": detection.bbox.x2,
-                                "y2": detection.bbox.y2
-                            }
-                        })
+                for detection in detections:
+                    await manager.safe_send(websocket, {
+                        "event_type": "plate_detected",
+                        "plate_number": detection.plate_number,
+                        "confidence": detection.confidence,
+                        "timestamp": detection.timestamp.isoformat(),
+                        "parking_lot_id": parking_lot_id,
+                        "camera_id": camera_id,
+                        "bbox": {
+                            "x1": detection.bbox.x1,
+                            "y1": detection.bbox.y1,
+                            "x2": detection.bbox.x2,
+                            "y2": detection.bbox.y2
+                        }
+                    })
                         
             except Exception as decode_error:
-                logger.error(f"Failed to process frame: {decode_error}")
-                # Only send error if WebSocket is still connected
-                try:
-                    if websocket.client_state.name == "CONNECTED":
-                        await websocket.send_json({
-                            "event_type": "error",
-                            "error": str(decode_error)
-                        })
-                except:
-                    # WebSocket already closed, just log
-                    pass
+                logger.error(f"[GATE] Frame processing error: {decode_error}")
+                await manager.safe_send(websocket, {"event_type": "error", "error": str(decode_error)})
     
     except WebSocketDisconnect:
+        logger.info("[GATE] Client disconnected from gate-monitor")
         manager.disconnect(websocket, "gate-monitor")
     except Exception as e:
-        logger.error(f"Gate monitor WebSocket error: {e}")
+        logger.error(f"[GATE] WebSocket error: {e}")
         manager.disconnect(websocket, "gate-monitor")
 
 
 @app.websocket("/ws/lot-monitor")
 async def lot_monitor_websocket(websocket: WebSocket):
     """
-    WebSocket endpoint for real-time parking capacity monitoring
-    Compatible with existing python-work WebSocket
+    WebSocket endpoint for real-time parking capacity monitoring.
+    Expects: { data: base64_image, parking_lot_id or parkingLotId or lot_id, camera_id or lot_id }
     """
     await manager.connect(websocket, "lot-monitor")
+    logger.info("[LOT] Client connected to /ws/lot-monitor")
+    frame_count = 0  # frame skip counter
     
     try:
         while True:
-            # Receive frame data
             data = await websocket.receive_json()
-            
-            # Support both 'data' and 'image' fields for compatibility
             image_data = data.get("data") or data.get("image", "")
             if not image_data:
-                logger.warning("Received empty image data")
+                logger.warning("[LOT] Frame skipped: no 'data' or 'image' in payload")
+                continue
+            
+            # Frame skip: only process every Nth frame
+            frame_count += 1
+            if frame_count % settings.lot_frame_skip != 0:
                 continue
             
             try:
-                # Decode image
                 image = frame_processor.decode_base64_image(image_data)
+                camera_id = (data.get("camera_id") or data.get("gate_id") or data.get("lot_id") or "unknown")
+                parking_lot_id = (data.get("parking_lot_id") or data.get("parkingLotId") or data.get("lot_id") or "unknown")
+                logger.debug(f"[LOT] Frame received (#{frame_count}): lot={parking_lot_id}, camera={camera_id}, image_len={len(image_data)}")
                 
-                # Extract metadata - support multiple field names
-                camera_id = (data.get("camera_id") or 
-                           data.get("gate_id") or 
-                           data.get("lot_id") or 
-                           "unknown")
-                parking_lot_id = (data.get("parking_lot_id") or 
-                                data.get("parkingLotId") or 
-                                data.get("lot_id") or 
-                                "unknown")
-                
-                # Detect parking slots
                 result = parking_slot_detector.detect_slots(
                     image,
                     camera_id=camera_id,
                     parking_lot_id=parking_lot_id
                 )
                 
-                # Feed slot detections into Pathway pipeline for stateful aggregation
-                if pathway_pipeline:
+                if pathway_pipeline and result.slots:
                     timestamp = int(result.timestamp.timestamp() * 1000)
                     for slot in result.slots:
                         pathway_pipeline.add_capacity_update(
@@ -517,6 +397,7 @@ async def lot_monitor_websocket(websocket: WebSocket):
                             confidence=slot.confidence,
                             timestamp=timestamp
                         )
+                    logger.info(f"[LOT] Pipeline fed {len(result.slots)} slot(s) for lot={parking_lot_id}, occupied={result.occupied}/{result.total_slots}")
                 
                 # Format slots for frontend
                 slots = []
@@ -534,38 +415,28 @@ async def lot_monitor_websocket(websocket: WebSocket):
                     })
                 
                 # Send results back to frontend (real-time feedback)
-                # Check if WebSocket is still open before sending
-                if websocket.client_state.name == "CONNECTED":
-                    await websocket.send_json({
-                        "event_type": "capacity_update",
-                        "parking_lot_id": parking_lot_id,
-                        "camera_id": camera_id,
-                        "total_slots": result.total_slots,
-                        "occupied": result.occupied,
-                        "empty": result.empty,
-                        "occupancy_rate": result.occupancy_rate,
-                        "slots": slots,
-                        "timestamp": result.timestamp.isoformat(),
-                        "processing_time_ms": result.processing_time_ms
-                    })
+                await manager.safe_send(websocket, {
+                    "event_type": "capacity_update",
+                    "parking_lot_id": parking_lot_id,
+                    "camera_id": camera_id,
+                    "total_slots": result.total_slots,
+                    "occupied": result.occupied,
+                    "empty": result.empty,
+                    "occupancy_rate": result.occupancy_rate,
+                    "slots": slots,
+                    "timestamp": result.timestamp.isoformat(),
+                    "processing_time_ms": result.processing_time_ms
+                })
                     
             except Exception as decode_error:
-                logger.error(f"Failed to process frame: {decode_error}")
-                # Only send error if WebSocket is still connected
-                try:
-                    if websocket.client_state.name == "CONNECTED":
-                        await websocket.send_json({
-                            "event_type": "error",
-                            "error": str(decode_error)
-                        })
-                except:
-                    # WebSocket already closed, just log
-                    pass
+                logger.error(f"[LOT] Frame processing error: {decode_error}")
+                await manager.safe_send(websocket, {"event_type": "error", "error": str(decode_error)})
     
     except WebSocketDisconnect:
+        logger.info("[LOT] Client disconnected from lot-monitor")
         manager.disconnect(websocket, "lot-monitor")
     except Exception as e:
-        logger.error(f"Lot monitor WebSocket error: {e}")
+        logger.error(f"[LOT] WebSocket error: {e}")
         manager.disconnect(websocket, "lot-monitor")
 
 
